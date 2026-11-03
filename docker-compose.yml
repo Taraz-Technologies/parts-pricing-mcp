@@ -1,0 +1,26 @@
+services:
+  api:
+    build: .
+    env_file: .env
+    volumes:
+      - pricing-data:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+
+  mcp:
+    build: .
+    command: ["python", "-m", "app.mcp_server"]
+    # Only these three: the MCP container never sees distributor keys.
+    environment:
+      PRICING_API_URL: http://api:8080
+      PRICING_API_KEY: ${MCP_CONSOLE_KEY}
+      MCP_BEARER_TOKEN: ${MCP_BEARER_TOKEN}
+    ports:
+      - "127.0.0.1:8090:8090"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pricing-data:

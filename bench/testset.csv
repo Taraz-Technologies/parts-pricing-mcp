@@ -1,0 +1,21 @@
+mpn,manufacturer,qty,note
+LM358DR,Texas Instruments,100,baseline IC
+NE555DR,Texas Instruments,50,baseline IC
+STM32F103C8T6,STMicroelectronics,20,MCU
+ATMEGA328P-AU,Microchip Technology,25,MCU
+ESP32-WROOM-32E-N4,Espressif Systems,10,module
+GRM188R71C104KA01D,Murata,4000,passive reel qty
+RC0603FR-0710KL,YAGEO,5000,passive reel qty
+CL10A106KP8NNNC,Samsung Electro-Mechanics,500,passive
+LM1117IMPX-3.3/NOPB,Texas Instruments,50,slash in MPN
+MCP2515-I/SO,Microchip Technology,10,slash in MPN
+"74HC595D,118",Nexperia,100,comma in MPN
+B2B-XH-A(LF)(SN),JST,200,parentheses in MPN
+MAX232CPE+,Analog Devices,5,plus sign in MPN
+0022232041,Molex,100,leading zeros
+2N7002,,500,ambiguous manufacturer
+BSS138,,500,ambiguous manufacturer
+TPS62160DGKR,Texas Instruments,30,power IC
+W25Q128JVSIQ,Winbond,30,flash
+USB4105-GF-A,GCT,50,connector
+CH340G,WCH,20,probably not stocked: not-found test
