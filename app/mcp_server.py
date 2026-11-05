@@ -12,6 +12,9 @@ from pydantic import BaseModel, Field
 mcp = FastMCP(
     "taraz-parts-pricing",
     stateless_http=True,
+    # Non-localhost host disables the SDK's localhost-only Host-header check (would 421 behind Railway's domain).
+    # BearerAuth is the gate.
+    host="0.0.0.0",
     instructions=(
         "Live DigiKey + Mouser list prices (USD), stock, MOQ, order multiples and lead times. "
         "Results are cached up to 12 h. Each distributor allows only ~1000 calls/day shared by all users: "
