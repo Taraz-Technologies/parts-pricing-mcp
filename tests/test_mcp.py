@@ -43,14 +43,18 @@ async def test_price_bom_and_rest_error(monkeypatch):
 async def test_bearer_auth():
     async def inner(scope, receive, send):
         await send({"type": "http.response.start", "status": 200, "headers": []})
-        await send({"type": "http.response.body", "body": b"ok"})
+        await send({"type": "http.response.body", "body": scope["path"].encode()})
 
-    async def call(app, headers):
+    async def call(app, headers, path="/mcp"):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as c:
-            return (await c.post("/mcp", headers=headers)).status_code
+            r = await c.post(path, headers=headers)
+            return r.status_code if r.status_code != 200 else r.text
 
     app = BearerAuth(inner, "s3cret")
     assert await call(app, {}) == 401
     assert await call(app, {"Authorization": "Bearer wrong"}) == 401
-    assert await call(app, {"Authorization": "Bearer s3cret"}) == 200
+    assert await call(app, {"Authorization": "Bearer s3cret"}) == "/mcp"
+    assert await call(app, {}, "/s3cret/mcp") == "/mcp"  # claude.ai: token in path, stripped before FastMCP
+    assert await call(app, {}, "/wrong/mcp") == 401
     assert await call(BearerAuth(inner, ""), {"Authorization": "Bearer "}) == 401  # empty token fails closed
+    assert await call(BearerAuth(inner, ""), {}, "//mcp") == 401

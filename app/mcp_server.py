@@ -80,16 +80,22 @@ async def quota_status() -> dict:
 
 
 class BearerAuth:
-    """Pure-ASGI: every HTTP request needs Authorization: Bearer <MCP_BEARER_TOKEN>. Lifespan passes through."""
+    """Pure-ASGI: every HTTP request needs Authorization: Bearer <MCP_BEARER_TOKEN>, or the token as the first
+    path segment (/<token>/mcp) for claude.ai connectors, which can't send headers. Lifespan passes through."""
 
     def __init__(self, app, token: str):
-        self.app, self.expected = app, f"Bearer {token}".encode()
+        self.app, self.token, self.expected = app, token.encode(), f"Bearer {token}".encode()
         self.enabled = bool(token)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             got = dict(scope.get("headers") or []).get(b"authorization", b"")
-            if not (self.enabled and secrets.compare_digest(got, self.expected)):
+            ok = self.enabled and secrets.compare_digest(got, self.expected)
+            if self.enabled and not ok:
+                first, _, rest = scope["path"].lstrip("/").partition("/")
+                if secrets.compare_digest(first.encode(), self.token):
+                    ok, scope = True, dict(scope, path="/" + rest, raw_path=("/" + rest).encode())
+            if not ok:
                 body = b'{"error":"unauthorized"}'
                 await send({"type": "http.response.start", "status": 401, "headers": [
                     (b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
@@ -104,7 +110,9 @@ def main():
     token = os.environ.get("MCP_BEARER_TOKEN", "")
     if not token:
         raise SystemExit("MCP_BEARER_TOKEN is not set")
-    uvicorn.run(BearerAuth(mcp.streamable_http_app(), token), host="0.0.0.0", port=int(os.environ.get("MCP_PORT", "8090")))
+    # access_log off: uvicorn would log /<token>/mcp paths, i.e. the secret.
+    uvicorn.run(BearerAuth(mcp.streamable_http_app(), token), host="0.0.0.0",
+                port=int(os.environ.get("MCP_PORT", "8090")), access_log=False)
 
 
 if __name__ == "__main__":
