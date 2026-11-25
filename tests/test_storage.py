@@ -1,3 +1,5 @@
+import asyncio
+import random
 from datetime import timedelta
 
 import pytest
@@ -42,6 +44,33 @@ async def test_reserve_stops_at_limit_minus_reserve(tmp_path, clock):
     clock["now"] += timedelta(days=1)
     assert await s.reserve("digikey", 5) == 2
     await s.close()
+
+
+async def test_concurrent_requests_share_the_connection(storage):
+    """Concurrent requests share one aiosqlite connection. Explicit COMMITs used to hit another request's open
+    cursor: "cannot commit transaction - SQL statements in progress" (an intermittent HTTP 500)."""
+    reserved = []
+
+    async def request(i):  # interleaved like real requests (fixed seed); with the old commits 38 of 40 failed
+        rnd = random.Random(i)
+        for j in range(20):
+            match rnd.choice("rclsgq "):
+                case "r":
+                    reserved.append(await storage.reserve("digikey", 10_000))
+                case "c":
+                    await storage.cache_put("digikey", f"P{i}-{j}|USD", True, [])
+                case "l":
+                    await storage.log("digikey", "productdetails", 1, "ok", 200, 5)
+                case "s":
+                    await storage.search_put("digikey", f"s{i}", {"j": j})
+                case "g":
+                    await storage.cache_get("digikey", [f"P{i}-{j}|USD"])
+                case "q":
+                    await storage.search_get("digikey", f"s{i}")
+                case _:
+                    await asyncio.sleep(0)
+    await asyncio.gather(*(request(i) for i in range(40)))
+    assert (await storage.quota("digikey", 10_000))["used"] == len(reserved) > 0
 
 
 async def test_upstream_remaining_and_stats(storage, clock):

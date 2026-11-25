@@ -4,13 +4,17 @@ from datetime import datetime, timezone
 
 import httpx
 
-from ..models import Offer, PriceBreak, ProviderLookup
+from ..models import Cart, CartItemIn, CartLine, Offer, PriceBreak, ProviderLookup
 from ..normalize import match_kind, parse_int_stock, parse_lead_time_weeks, parse_price, to_int
 from .base import Provider, ProviderError, flag_missing
 
 
+CART_KEY = "mouser_cart_key"  # kv: cart created by the first add when MOUSER_CART_KEY is empty
+
+
 class Mouser(Provider):
-    """Mouser Search API v1. The key is a URL query param: never put the URL in a message or log."""
+    """Mouser Search API v1 + Cart API v1 (separate "Cart and Order" key). Keys are URL query params:
+    never put the URL in a message or log."""
     name = "mouser"
 
     def __init__(self, settings, storage, http):
@@ -33,7 +37,9 @@ class Mouser(Provider):
             msg = str(e0.get("Message") if isinstance(e0, dict) else e0)
             if isinstance(e0, dict) and e0.get("PropertyName"):  # e.g. "Required" + "API Key"
                 msg += f" ({e0['PropertyName']})"
-            msg = msg.replace(self.s.mouser_search_api_key.get_secret_value(), "***")
+            for key in (self.s.mouser_search_api_key, self.s.mouser_cart_api_key):
+                if key.get_secret_value():
+                    msg = msg.replace(key.get_secret_value(), "***")
             low = msg.lower()
             code = "rate_limited" if any(w in low for w in ("too many", "rate", "limit")) else "upstream_error"
             raise ProviderError(code, f"mouser: {msg}", r.status_code)
@@ -111,3 +117,54 @@ class Mouser(Provider):
             lead_time_weeks=parse_lead_time_weeks(p.get("LeadTime")), lifecycle=p.get("LifecycleStatus"),
             rohs=p.get("ROHSStatus"), datasheet_url=p.get("DataSheetUrl"), product_url=p.get("ProductDetailUrl"),
             image_url=p.get("ImagePath"), match=kind, fetched_at=datetime.now(timezone.utc)))
+
+    # --- Cart API. Never the Order API.
+    async def _cart_call(self, op: str, method: str, path: str, n_parts: int = 1, **kw) -> dict:
+        key = self.s.mouser_cart_api_key.get_secret_value()
+        if not key:
+            raise ProviderError("not_configured", "mouser cart key (MOUSER_CART_API_KEY) not set")
+        params = {"apiKey": key, **kw.pop("params", {})}
+        r = await self.upstream(op, method, self.base + path, path=path, n_parts=n_parts, check=self._check,
+                                params=params, **kw)
+        return r.json()
+
+    async def _cart_key(self) -> str:
+        return self.s.mouser_cart_key or await self.storage.kv_get(CART_KEY) or ""
+
+    async def cart_view(self) -> Cart:
+        key = await self._cart_key()
+        if not key:
+            if not self.s.mouser_cart_api_key.get_secret_value():
+                raise ProviderError("not_configured", "mouser cart key (MOUSER_CART_API_KEY) not set")
+            return Cart(provider="mouser", warnings=["empty: no cart yet (the first add creates one)"])
+        return self._map_cart(await self._cart_call("cart", "GET", "/api/v1/cart", params={"cartKey": key}))
+
+    async def cart_add(self, items: list[CartItemIn]) -> Cart:
+        key, j = await self._cart_key(), {}
+        for i in range(0, len(items), 100):  # Mouser takes at most 100 items per request
+            chunk = items[i:i + 100]
+            j = await self._cart_call("cart_insert", "POST", "/api/v1/cart/items/insert", n_parts=len(chunk), json={
+                "CartKey": key, "CartItems": [{"MouserPartNumber": it.sku, "Quantity": it.qty,
+                                               **({"CustomerPartNumber": it.customer_ref} if it.customer_ref else {})}
+                                              for it in chunk]})
+            if not key and j.get("CartKey"):  # empty CartKey: Mouser created a cart; keep using it
+                key = j["CartKey"]
+                if not self.s.mouser_cart_key:
+                    await self.storage.kv_set(CART_KEY, key)
+        return self._map_cart(j)
+
+    @staticmethod
+    def _map_cart(j: dict) -> Cart:
+        lines = []
+        for ln in j.get("CartItems") or []:
+            line = CartLine(sku=ln.get("MouserPartNumber"), mpn=ln.get("MfrPartNumber"),
+                            manufacturer=ln.get("Manufacturer"), description=ln.get("Description"),
+                            qty=to_int(ln.get("Quantity")), unit_price=parse_price(ln.get("UnitPrice")),
+                            extended_price=parse_price(ln.get("ExtendedPrice")),
+                            customer_ref=ln.get("CartItemCustPartNumber") or None)
+            line.warnings += [str(e.get("Message") if isinstance(e, dict) else e) for e in ln.get("Errors") or []]
+            line.warnings += [str(m.get("Message") if isinstance(m, dict) else m) for m in ln.get("InfoMessages") or []]
+            line.warnings += [f"missing:{f}" for f in ("unit_price", "extended_price") if getattr(line, f) is None]
+            lines.append(line)
+        return Cart(provider="mouser", cart_id=j.get("CartKey"), currency=j.get("CurrencyCode"), lines=lines,
+                    total=parse_price(j.get("MerchandiseTotal")))

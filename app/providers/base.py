@@ -7,7 +7,7 @@ import httpx
 
 from ..config import Settings
 from ..limiter import MinuteLimiter, RateLimited
-from ..models import Offer, ProviderLookup, ProviderStatus
+from ..models import Cart, CartItemIn, Offer, ProviderLookup, ProviderStatus
 from ..storage import QuotaExhausted, Storage
 
 asyncio_sleep = asyncio.sleep  # module attr so tests can skip real waits
@@ -18,6 +18,10 @@ class ProviderError(Exception):
     def __init__(self, code: str, message: str, http_status: int | None = None):
         super().__init__(message)
         self.code, self.message, self.http_status = code, message, http_status
+
+
+class SpecError(ValueError):
+    """A spec-search category, parameter or value the distributor doesn't have: the caller's input (HTTP 422)."""
 
 
 _KEY_FIELDS = ("manufacturer", "stock", "moq", "price_breaks", "currency")
@@ -57,6 +61,13 @@ class Provider(ABC):
     @abstractmethod
     async def keyword(self, q: str, limit: int) -> tuple[list[Offer], int | None]:
         """(offers, total results upstream)."""
+
+    # Cart: optional. Never place orders.
+    async def cart_view(self) -> Cart:
+        raise ProviderError("not_configured", f"{self.name}: no cart support")
+
+    async def cart_add(self, items: list[CartItemIn]) -> Cart:
+        raise ProviderError("not_configured", f"{self.name}: no cart support")
 
     def status(self, *, found: bool = False, error: ProviderError | None = None, latency_ms: int | None = None,
                from_cache: bool = False) -> ProviderStatus:

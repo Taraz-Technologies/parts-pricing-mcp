@@ -24,6 +24,13 @@ class Settings(BaseSettings):
     mouser_per_minute: int = 25
     mouser_batch_size: int = 10
 
+    # Cart (write) features. Off unless a client is listed in CART_CLIENTS.
+    cart_clients: str = ""  # console names allowed to use /v1/cart*, /v1/digikey/connect, e.g. "mcpcart"
+    mouser_cart_api_key: SecretStr = SecretStr("")  # My Mouser "Cart and Order" key, not the search key
+    mouser_cart_key: str = ""  # cart to use; empty -> the first add creates one and it is remembered
+    digikey_redirect_uri: str = ""  # https://<api-domain>/v1/digikey/callback, registered on the DigiKey app
+    digikey_list_name: str = "Taraz cart"  # MyList used as the DigiKey cart
+
     quota_reserve: int = 50
     cache_ttl_hours: float = 12
     notfound_ttl_hours: float = 24
@@ -44,18 +51,22 @@ class Settings(BaseSettings):
                 out[key.strip()] = name.strip()
         return out
 
+    def cart_client_names(self) -> set[str]:
+        return {n.strip() for n in self.cart_clients.split(",") if n.strip()}
 
-_API_KEY_RX = re.compile(r"apiKey=[^&\s\"']+")
+
+# Mouser keys and the one-time DigiKey OAuth code are URL query params.
+_SECRET_PARAM_RX = re.compile(r"\b(apiKey|code)=[^&\s\"']+")
 
 
 def redact(text: str) -> str:
-    return _API_KEY_RX.sub("apiKey=***", text)
+    return _SECRET_PARAM_RX.sub(r"\1=***", text)
 
 
 class RedactFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
-        if "apiKey=" in msg:
+        if "apiKey=" in msg or "code=" in msg:
             record.msg, record.args = redact(msg), None
         return True
 

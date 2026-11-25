@@ -2,12 +2,13 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, PlainSerializer
+from pydantic import BaseModel, Field, PlainSerializer
 
 # Computed as Decimal, serialized as a JSON number rounded to 5 dp.
 Money = Annotated[Decimal, PlainSerializer(lambda d: float(round(d, 5)), return_type=float, when_used="json")]
 
-ErrorCode = Literal["not_configured", "rate_limited", "quota_exhausted", "auth_failed", "upstream_error", "timeout"]
+ErrorCode = Literal["not_configured", "not_connected", "rate_limited", "quota_exhausted", "auth_failed",
+                    "upstream_error", "timeout"]
 
 
 class PriceBreak(BaseModel):
@@ -99,3 +100,62 @@ class BomResult(BaseModel):
     summary: dict
     provider_status: list[ProviderStatus]
     quota: dict
+
+
+class Spec(BaseModel):
+    name: str | None
+    value: str | None
+
+
+class ProductSpecs(BaseModel):
+    mpn: str | None
+    manufacturer: str | None = None
+    description: str | None = None
+    skus: list[str] = []
+    datasheet_url: str | None = None
+    product_url: str | None = None
+    match: Literal["exact", "loose"] = "exact"
+    category: str | None = None  # DigiKey leaf category: what search_by_specs takes
+    category_id: int | None = None
+    specs: list[Spec] = []
+
+
+class PartRef(BaseModel):
+    """A substitute or related product as DigiKey reports it (not priced at a quantity)."""
+    kind: str | None = None  # substitute type, "alternate_packaging", "mating", "for_use_with", "associated", "kit"
+    mpn: str | None = None
+    manufacturer: str | None = None
+    sku: str | None = None
+    description: str | None = None
+    stock: int | None = None
+    unit_price: Money | None = None
+    product_url: str | None = None
+
+
+class CartItemIn(BaseModel):
+    provider: Literal["mouser", "digikey"]
+    sku: str = Field(min_length=1, max_length=100)
+    qty: int = Field(ge=1, le=10_000_000)
+    customer_ref: str | None = Field(None, max_length=100)
+
+
+class CartLine(BaseModel):
+    sku: str | None = None
+    mpn: str | None = None
+    manufacturer: str | None = None
+    description: str | None = None
+    qty: int | None = None
+    unit_price: Money | None = None
+    extended_price: Money | None = None
+    customer_ref: str | None = None
+    warnings: list[str] = []
+
+
+class Cart(BaseModel):
+    provider: str
+    cart_id: str | None = None  # Mouser cart key / DigiKey list id
+    name: str | None = None
+    currency: str | None = None
+    lines: list[CartLine] = []
+    total: Money | None = None
+    warnings: list[str] = []

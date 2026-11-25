@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runbook Step 2 smoke tests: saves real DigiKey + Mouser responses into fixtures/.
-# Reads keys from .env; never prints them. Uses ~5 DigiKey + ~3 Mouser calls.
+# Reads keys from .env; never prints them. Uses ~7 DigiKey + ~3 Mouser calls.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 set -a; source .env; set +a
@@ -26,6 +26,23 @@ if [ ${#TOKEN} -gt 20 ]; then
   dk "https://api.digikey.com/products/v4/search/NOTAREALPART12345XYZ/productdetails" digikey_productdetails_notfound
   dk "https://api.digikey.com/products/v4/search/keyword" digikey_keyword_2N7002 -X POST \
     -H "Content-Type: application/json" -d '{"Keywords":"2N7002","Limit":5,"Offset":0}'
+  # Search by spec: category tree, ceramic-capacitor filter options, then one filtered page for 10nF 50V 10% X7R 0603,
+  # in stock, no Vishay. The request file is built by the app from the options just captured (tests check that the
+  # service sends exactly it), so the captured page always answers the request the app really makes.
+  dk "https://api.digikey.com/products/v4/search/categories" digikey_categories
+  dk "https://api.digikey.com/products/v4/search/keyword" digikey_keyword_cat60_options -X POST \
+    -H "Content-Type: application/json" -d '{"Keywords":"","Limit":1,"Offset":0,"FilterOptionsRequest":{"CategoryFilter":[{"Id":"60"}]}}'
+  "$PY" - <<'EOF'
+import json
+from app.providers.digikey import SORT, DigiKey
+opts = DigiKey.options_from(json.load(open("fixtures/digikey_keyword_cat60_options.json", encoding="utf-8")), 60)
+specs = {"Capacitance": "10nF", "Voltage": "50V", "Tolerance": "10%", "Temperature Coefficient": "X7R", "Package": "0603"}
+fo, _, _ = DigiKey.spec_filters(60, opts, specs, rohs=True, active_only=True, in_stock=True, exclude_manufacturers=["Vishay"])
+json.dump({"Keywords": "", "Limit": 10, "Offset": 0, "FilterOptionsRequest": fo, "SortOptions": SORT},
+          open("fixtures/digikey_keyword_specs_10nF50V.request.json", "w", encoding="utf-8"), ensure_ascii=False)
+EOF
+  dk "https://api.digikey.com/products/v4/search/keyword" digikey_keyword_specs_10nF50V -X POST \
+    -H "Content-Type: application/json" --data-binary @fixtures/digikey_keyword_specs_10nF50V.request.json
   grep -i ratelimit fixtures/digikey_productdetails_LM358DR.headers.txt || true
 fi
 

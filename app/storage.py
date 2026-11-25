@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS request_log(id INTEGER PRIMARY KEY AUTOINCREMENT, ts 
   provider TEXT, op TEXT, n_parts INTEGER, status TEXT, http_status INTEGER, latency_ms INTEGER,
   upstream_remaining INTEGER);
 CREATE INDEX IF NOT EXISTS request_log_ts ON request_log(ts);
+CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
 """
 
 
@@ -43,10 +44,11 @@ class Storage:
         self.db: aiosqlite.Connection | None = None
 
     async def open(self) -> "Storage":
-        self.db = await aiosqlite.connect(self.path)
+        # Autocommit: every write here is one statement, atomic on its own. Explicit COMMITs raced the open
+        # cursors of concurrent requests ("cannot commit transaction - SQL statements in progress").
+        self.db = await aiosqlite.connect(self.path, isolation_level=None)
         await self.db.execute("PRAGMA journal_mode=WAL")
         await self.db.executescript(SCHEMA)
-        await self.db.commit()
         return self
 
     async def close(self) -> None:
@@ -69,7 +71,6 @@ class Storage:
     async def cache_put(self, provider: str, key: str, found: bool, offers: list[dict]) -> None:
         await self.db.execute("INSERT OR REPLACE INTO part_cache VALUES(?,?,?,?,?)",
                               (provider, key, int(found), json.dumps(offers), utcnow().isoformat()))
-        await self.db.commit()
 
     async def search_get(self, provider: str, key: str) -> dict | None:
         async with self.db.execute("SELECT payload, fetched_at FROM search_cache WHERE provider=? AND cache_key=?",
@@ -82,7 +83,6 @@ class Storage:
     async def search_put(self, provider: str, key: str, payload: dict) -> None:
         await self.db.execute("INSERT OR REPLACE INTO search_cache VALUES(?,?,?,?)",
                               (provider, key, json.dumps(payload), utcnow().isoformat()))
-        await self.db.commit()
 
     # --- quota: UTC day, reserve is atomic (single upsert statement)
     async def reserve(self, provider: str, daily_limit: int) -> int:
@@ -96,7 +96,6 @@ class Storage:
             (provider, utcnow().date().isoformat(), cap),
         ) as cur:
             row = await cur.fetchone()
-        await self.db.commit()
         if row is None:
             raise QuotaExhausted(provider)
         return cap - row[0]
@@ -106,7 +105,6 @@ class Storage:
             "INSERT INTO quota_usage(provider, day, used, upstream_remaining) VALUES(?,?,0,?) "
             "ON CONFLICT(provider, day) DO UPDATE SET upstream_remaining=excluded.upstream_remaining",
             (provider, utcnow().date().isoformat(), remaining))
-        await self.db.commit()
 
     async def quota(self, provider: str, daily_limit: int) -> dict:
         async with self.db.execute("SELECT used, upstream_remaining FROM quota_usage WHERE provider=? AND day=?",
@@ -114,6 +112,18 @@ class Storage:
             used, upstream = (await cur.fetchone()) or (0, None)
         return {"used": used, "limit": daily_limit, "reserve": self.quota_reserve,
                 "remaining": max(0, daily_limit - self.quota_reserve - used), "upstream_remaining_last_seen": upstream}
+
+    # --- kv: DigiKey refresh token (it rotates, so it can't live in env), remembered cart/list ids
+    async def kv_get(self, key: str) -> str | None:
+        async with self.db.execute("SELECT value FROM kv WHERE key=?", (key,)) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def kv_set(self, key: str, value: str | None) -> None:
+        if value is None:
+            await self.db.execute("DELETE FROM kv WHERE key=?", (key,))
+        else:
+            await self.db.execute("INSERT OR REPLACE INTO kv VALUES(?,?,?)", (key, value, utcnow().isoformat()))
 
     # --- request log
     async def log(self, provider: str, op: str, n_parts: int, status: str, http_status: int | None = None,
@@ -123,7 +133,6 @@ class Storage:
             " VALUES(?,?,?,?,?,?,?,?,?)",
             (utcnow().isoformat(), current_client.get(), provider, op, n_parts, status, http_status, latency_ms,
              upstream_remaining))
-        await self.db.commit()
 
     async def stats(self, hours: float = 24) -> dict:
         since = (utcnow() - timedelta(hours=hours)).isoformat()

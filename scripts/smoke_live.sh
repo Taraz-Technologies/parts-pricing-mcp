@@ -51,5 +51,14 @@ calls=$((after - before))
 check "6 20-line BOM: mouser upstream calls ${calls} <= 2" "$( [ "$calls" -le 2 ] && echo true || echo false )"
 jq -c '{summary, provider_status: [.provider_status[] | {provider, ok, error_code, message}]}' <<<"$r"
 
+spec='{"category":"Ceramic Capacitors","specs":{"Capacitance":"10nF","Voltage - Rated":"50V","Tolerance":"10%",
+  "Temperature Coefficient":"X7R","Package / Case":"0603"},"in_stock":true,"exclude_manufacturers":["Vishay"]}'
+r=$(curl -s -X POST -H "X-API-Key: $CONSOLE_KEY" -H "Content-Type: application/json" -d "$spec" "$API/v1/search/specs")
+check "7 spec search 10nF 50V 10% X7R 0603: every match back, all Active, no Vishay, 3 capacitance values" \
+  "$(jq '(.total // 0) > 0 and (.results | length) == ([.total, 200] | min)
+         and (.filters.specs.Capacitance | length == 3)
+         and ([.results[] | .lifecycle == "Active" and ((.manufacturer // "") | test("Vishay") | not)] | all)' <<<"$r")"
+jq -c '{detail, total, truncated, status: [(.provider_status // [])[] | {provider, ok, error_code, message}]}' <<<"$r"
+
 echo "---- $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -5,6 +5,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from app.api import create_app
 from app.config import Settings
 from app.storage import Storage
 
@@ -40,6 +41,22 @@ async def storage(settings):
 async def http():
     async with httpx.AsyncClient() as c:
         yield c
+
+
+@pytest.fixture
+async def api(tmp_path):
+    made = []
+
+    async def make(**kw):
+        app = create_app(make_settings(tmp_path, **kw))
+        ctx = app.router.lifespan_context(app)
+        await ctx.__aenter__()
+        made.append(ctx)
+        return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+
+    yield make
+    for ctx in made:
+        await ctx.__aexit__(None, None, None)
 
 
 @pytest.fixture

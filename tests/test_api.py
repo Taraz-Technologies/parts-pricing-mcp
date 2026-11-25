@@ -5,27 +5,9 @@ import httpx
 import pytest
 import respx
 
-from app.api import create_app
-
-from .conftest import DK, MOUSER_HOST, dk_product, make_settings, mock_token, mouser_part, mouser_response
+from .conftest import DK, MOUSER_HOST, dk_product, mock_token, mouser_part, mouser_response
 
 PK = {"X-API-Key": "pk"}
-
-
-@pytest.fixture
-async def api(tmp_path):
-    made = []
-
-    async def make(**kw):
-        app = create_app(make_settings(tmp_path, **kw))
-        ctx = app.router.lifespan_context(app)
-        await ctx.__aenter__()
-        made.append(ctx)
-        return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
-
-    yield make
-    for ctx in made:
-        await ctx.__aexit__(None, None, None)
 
 
 @pytest.fixture

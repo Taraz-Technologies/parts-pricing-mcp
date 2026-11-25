@@ -123,6 +123,7 @@ async def test_quota_exhausted_makes_no_call(tmp_path, storage, http, router):
 
 async def test_keyword_search_picks_cut_tape(dk, router):
     p = dk_product("2N7002", package="Tape & Reel (TR)")
+    p["ProductVariations"][0]["DigiKeyProductNumber"] = "2N7002-TR"  # distinct, so picking the reel would fail
     p["ProductVariations"].append({**p["ProductVariations"][0], "PackageType": {"Name": "Cut Tape (CT)"},
                                    "DigiKeyProductNumber": "2N7002-CT"})
     router.post(KEYWORD).mock(return_value=httpx.Response(200, json={"Products": [p], "ProductsCount": 41}))

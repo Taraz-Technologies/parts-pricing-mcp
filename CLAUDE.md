@@ -9,9 +9,13 @@ Phase 2 adds Arrow, Verical, Future Electronics, Element14, Online Components. E
 sit behind the same `Provider` interface so adding one = adding one file.
 
 ## Hard rules
-1. READ-ONLY. No code for DigiKey Ordering/Quoting/MyLists/Order Status or any Mouser cart/order API.
+1. NEVER PLACE ORDERS. No code for DigiKey Ordering/Quoting/Order Status or the Mouser Order API.
+   The only writes allowed (approved 2026-11-05): Mouser Cart API view + items/insert, and DigiKey
+   MyLists (one named list = the DigiKey "cart"; DigiKey has no cart API). Cart endpoints only for
+   clients in CART_CLIENTS; cart MCP tools only in a separate deployment (MCP_ENABLE_CART=1).
 2. Secrets only from env vars via pydantic-settings. Never log, print, return, or embed them in
-   exception messages. Never open or print `.env` or `*.env`.
+   exception messages. Never open or print `.env` or `*.env`. One exception: the DigiKey 3-legged
+   refresh token rotates on every use, so it lives in SQLite (kv table, data volume); never return it.
 3. Mouser's key is a URL query param (`?apiKey=`). Set loggers `httpx` and `httpcore` to WARNING.
    Install a logging.Filter on the root logger that rewrites `apiKey=[^&\s"']+` → `apiKey=***`.
    When converting httpx exceptions, never include `str(request.url)`; use provider + path only.
@@ -70,7 +74,13 @@ Dockerfile, docker-compose.yml, .env.example
 | DATA_DIR | ./data | sqlite file: DATA_DIR/pricing.db |
 | CONSOLE_API_KEYS | – | "planner:KEY,prc:KEY,mcp:KEY" (name:key pairs) |
 | LOG_LEVEL | INFO | |
-MCP container only: PRICING_API_URL, PRICING_API_KEY, MCP_BEARER_TOKEN, MCP_PORT (8090).
+| CART_CLIENTS | – | console names allowed to use cart endpoints, e.g. "mcpcart"; empty = cart off |
+| MOUSER_CART_API_KEY | – | My Mouser → APIs "Cart and Order" key (NOT the search key) |
+| MOUSER_CART_KEY | – | cart to use; empty → first add creates one, remembered in kv |
+| DIGIKEY_REDIRECT_URI | – | https://<api-domain>/v1/digikey/callback; must exactly match the DigiKey app |
+| DIGIKEY_LIST_NAME | Taraz cart | MyList used as the DigiKey cart |
+MCP container only: PRICING_API_URL, PRICING_API_KEY, MCP_BEARER_TOKEN, MCP_PORT (8090),
+MCP_ENABLE_CART (cart deployment only, with an API key whose client is in CART_CLIENTS).
 
 ## Models (app/models.py)
 PriceBreak { qty:int, unit_price:Decimal }
@@ -164,6 +174,58 @@ Mapping per Part:
   datasheet_url ← DataSheetUrl; product_url ← ProductDetailUrl; image_url ← ImagePath
 Check names against fixtures/mouser_*.json first.
 
+## DigiKey extras + MyLists (names verified against DigiKey's OAS files, 2026-11-05)
+Read-only, 2-legged: specs ← Product.Parameters[{ParameterText, ValueText}] via the same productdetails →
+keyword flow, plus the leaf category (end of Product.Category.ChildCategories: what spec search takes); substitutes ← GET /products/v4/search/{mpn}/substitutions (ProductSubstitutes[]) +
+/alternatepackaging (AlternatePackagings.AlternatePackaging[]); related ← /associations
+(ProductAssociations {MatingProducts, ForUseWithProducts, AssociatedProducts, Kits}). 404 → empty, not error.
+MyLists needs 3-legged OAuth: GET {BASE}/v1/oauth2/authorize?response_type=code&client_id&redirect_uri&state
+→ callback ?code (valid 1 min) → POST token grant_type=authorization_code. Refresh tokens ROTATE: save the
+new one every refresh, under a lock; 400/401 on refresh → delete it, error_code "not_connected".
+Lists: GET {BASE}/mylists/v1/lists?startIndex&limit (find ListName), POST /lists {"ListName"}, then re-find
+by name (create's string response isn't documented as the id). Add: POST /lists/{id}/parts
+[{RequestedPartNumber, Quantities:[{Quantity}], CustomerReference?}]. View: GET /lists/{id}/parts
+(countryIso, currencyIso, languageIso) → PartsList[], price from Quantities[0].PackOptions[SelectedPackOptionIndex].
+List id remembered in kv; 404 → forget it.
+
+## DigiKey spec search (verified live 2026-11-25 against DigiKey's OAS + fixtures/digikey_categories,
+## *_cat60_options, *_specs_10nF50V; the .request.json is exactly what the service sends)
+Every DigiKey part in one leaf category whose parametric values match (alternates / SwapDB). Mouser has no
+parametric API (its v1/v2 Swagger has no attribute fields): callers price_bom the MPNs, providers=["mouser"].
+Category (name any case, or id): GET /products/v4/search/categories → Categories[{CategoryId, Name, Children[]}]
+  (1201 nodes) → [id, name, parent id]. 27 names repeat → 422 asking for the id; a parent → 422 listing its leaves
+  (DigiKey filters specs per leaf only). An empty tree is an upstream_error, never cached.
+Options: POST keyword {"Keywords":"","Limit":1,"Offset":0,"FilterOptionsRequest":{"CategoryFilter":[{"Id":"60"}]}}
+  → FilterOptions.ParametricFilters[{ParameterId, ParameterName, FilterValues[{ValueId, ValueName}]}] (every value
+  of the category) + Manufacturers[{Id, Value}] (DigiKey.options_from). ValueId is the text for UnitOfMeasure
+  params ("10 nF"), a number string otherwise. Products but no Manufacturers → upstream_error, never cached.
+Spec name: casefold exact, else a unique prefix ("Voltage" → "Voltage - Rated"); two names for one parameter → 422.
+  Value: normalize.match_values. A quantity with a prefix or unit compares by value only (10nF = 0.01 µF =
+  10000 pF, DigiKey lists all three; 500 = 500V; 1 mOhms != 1 MOhms); everything else, bare numbers included, as
+  text with case, spaces, ± and µ/u ignored (so 1005 != 01005) and NP0 = NPO = C0G = COG. Compared against every
+  ",", "|" and letter-"/" piece of a value and the lead/paren of "lead (paren)": "0603" → "0603 (1608 Metric)",
+  never "0201 (0603 Metric)"; "630V" → "600V/630V"; never "10W" from "1/10W". A list = any of. No match → 422 with
+  the nearest values (by quantity when the want is one); NEVER drop a filter.
+Search: same POST + "SortOptions":{"Field":"ManufacturerProductNumber","SortOrder":"Ascending"} (fixed order for
+  Offset paging), FilterOptionsRequest {CategoryFilter, MarketPlaceFilter "ExcludeMarketPlace", StatusFilter
+  [{"Id":"0"}] (Active; 1 Obsolete, 2 Discontinued at DigiKey, 4 Last Time Buy, 7 NRND), SearchOptions
+  ["RohsCompliant","InStock"], ManufacturerFilter (include-only, so: every manufacturer not containing an excluded
+  word), ParameterFilterRequest {CategoryFilter {Id}, ParameterFilters [{ParameterId, FilterValues [{Id}]}] sorted
+  by ParameterId}}. ProductsCount = exact total. Limit 50, Offset pages in a TaskGroup up to max_results. A failed
+  page cancels the rest and fails the search; so do a missing ProductsCount and fewer unique products than
+  min(total, max_results). One result per product: _pick (DigiKey-sold Cut Tape, else first non-marketplace) +
+  specs [{name, value}] from Parameters [{ParameterText, ValueText}]. DigiKey's keyword data can lag up to 24 h
+  (its FAQ): price_bom gives real-time stock/price.
+Cache: search_cache keys categories|, spec_options|<id>, spec_search|<filters, max_results, currency>; one fetch
+  per key at a time (concurrent searches wait instead of spending quota); fresh=true refetches all three.
+
+## Mouser cart (Cart API v1, MOUSER_CART_API_KEY)
+GET /api/v1/cart?apiKey&cartKey; POST /api/v1/cart/items/insert?apiKey {"CartKey", "CartItems":[
+{MouserPartNumber, Quantity, CustomerPartNumber?}]} (≤100 items per call; empty CartKey creates a cart).
+Never POST /api/v1/cart (replaces the whole cart) or anything under /order.
+Response CartItems[]: MouserPartNumber, MfrPartNumber, Quantity, UnitPrice, ExtendedPrice, Errors[],
+InfoMessages[]; MerchandiseTotal, CurrencyCode. Cart and MyLists calls count against the same daily quota.
+
 ## Pricing (app/pricing.py)
 price_offer(offer, qty):
   order_qty = max(qty, offer.moq or 1)
@@ -190,7 +252,8 @@ Worked tests (breaks (1,0.42),(10,0.297),(100,0.186), moq 1, mult 1 unless state
   stock 30, qty 50 → in_stock False
   no breaks → unit None, excluded "no_price"
 
-## Storage (app/storage.py, aiosqlite, WAL mode)
+## Storage (app/storage.py, aiosqlite, WAL mode, autocommit: every write is one statement; explicit COMMITs
+## raced other requests' open cursors on the shared connection)
 CREATE TABLE IF NOT EXISTS part_cache(provider TEXT, cache_key TEXT, found INTEGER NOT NULL,
   payload TEXT NOT NULL, fetched_at TEXT NOT NULL, PRIMARY KEY(provider, cache_key));
   cache_key = mpn_strict + "|" + currency. TTL: CACHE_TTL_HOURS if found else NOTFOUND_TTL_HOURS.
@@ -205,6 +268,8 @@ CREATE TABLE IF NOT EXISTS request_log(id INTEGER PRIMARY KEY AUTOINCREMENT, ts 
   provider TEXT, op TEXT, n_parts INTEGER, status TEXT, http_status INTEGER, latency_ms INTEGER,
   upstream_remaining INTEGER);
   status ∈ ok|not_found|cache_hit|error:<code>. Log every upstream call AND every cache hit.
+CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+  digikey_refresh_token, digikey_list_id, mouser_cart_key.
 MinuteLimiter(per_minute, max_wait): sliding 60 s window; acquire() waits; if it would wait longer
 than max_wait → raise RateLimited.
 
@@ -222,6 +287,11 @@ GET  /v1/part?mpn=&qty=1&manufacturer=&providers=digikey,mouser&fresh=false → 
      (MPN is a query param, NOT a path segment: MPNs contain "/", "#", ",").
 POST /v1/search {"keyword":str,"limit":10,"providers":[...]} →
      {"keyword","results":[Offer],"total_by_provider":{},"provider_status":[]}
+POST /v1/search/specs {"category","specs":{name: value|[values]} (1-30 specs, values 1-100 chars, lists ≤50),
+     "rohs":true,"active_only":true,"in_stock":false,"exclude_manufacturers":[],"max_results":200 (≤500),
+     "fresh":false} → {"category":{id,name},"filters":{"specs":{name:[DigiKey values]},"excluded_manufacturers",...},
+     "total","truncated","results":[Offer + "specs"],"warnings","provider_status"}. DigiKey only. Unknown or
+     misspelled fields, and categories/specs/values DigiKey doesn't have → 422 (a dropped filter returns wrong parts).
 POST /v1/bom/price {"lines":[{"line_id":"R1","mpn":"...","qty":100,"manufacturer":null}],
      "providers":["digikey","mouser"],"fresh":false} → BomResult; >BOM_MAX_LINES → 413.
      Duplicate MPNs are looked up once.
@@ -233,15 +303,30 @@ GET  /v1/quota → {"day":"YYYY-MM-DD","providers":{"digikey":{"used","limit","r
      "upstream_remaining_last_seen"},"mouser":{...}}}
 GET  /v1/stats?hours=24 → per provider: upstream_calls, errors, cache_hits, cache_hit_rate,
      latency_ms p50/p95 (upstream only), calls_by_client.
+GET  /v1/part/{specs|substitutes|related}?mpn= → DigiKey only, cached SEARCH_TTL_HOURS:
+     {"mpn","products"|"substitutes"+"alternate_packaging"|"related":[...],"provider_status":[...]}
+Cart (403 unless the client is in CART_CLIENTS):
+GET  /v1/cart → {"carts":[Cart],"provider_status":[...]}
+POST /v1/cart/add {"items":[{"provider":"mouser"|"digikey","sku","qty","customer_ref"?}]} → same + note
+GET  /v1/digikey/connect → {"connected","authorize_url","message"} (one-time state, 10 min)
+GET  /v1/digikey/callback?code&state → public; the one-time state is the gate. Log redaction covers code=.
 
 ## MCP server (app/mcp_server.py)
 FastMCP("taraz-parts-pricing", stateless_http=True). Tools call the REST API with httpx using
 PRICING_API_URL + PRICING_API_KEY. NO distributor keys in this process.
-All tools annotated readOnlyHint=True, openWorldHint=True. Return the REST JSON.
+Read tools annotated readOnlyHint=True, openWorldHint=True. Return the REST JSON.
   search_parts(keyword:str, limit:int=10)
+  search_by_specs(category, specs:dict, in_stock=False, exclude_manufacturers=None, rohs=True, active_only=True,
+                  max_results=50)   docstring maps Taraz PNs (TZCC10NF50V10%X7R0603, TZR22K1%0.1W0603) to DigiKey
+                  names. Returns compact JSON text (~800 chars/part, so it fits MCP output caps): lean offer
+                  fields, price_breaks [[qty, unit]], and only the specs that were not searched.
   get_part_offers(mpn:str, qty:int=1, manufacturer:str|None=None)
-  price_bom(lines:list[{mpn:str, qty:int, line_id?:str, manufacturer?:str}], fresh:bool=False)
-  quota_status()
+  price_bom(lines:list[{mpn:str, qty:int, line_id?:str, manufacturer?:str}], fresh:bool=False,
+            providers:list["digikey"|"mouser"]|None=None)   one distributor spends none of the other's quota
+  quota_status(), get_part_specs(mpn), find_substitutes(mpn), get_related_parts(mpn)
+Cart tools, only when MCP_ENABLE_CART=1 (server name "taraz-parts-cart"):
+  review_cart(), connect_digikey() (readOnlyHint), add_to_cart(items) (readOnlyHint=False,
+  destructiveHint=False). add_to_cart's docstring tells the model to confirm items with the user first.
 Docstrings must tell the model: prices are live distributor list prices (USD), cached up to 12 h, and
 quota is ~1000 calls/day per distributor, so use price_bom for many parts instead of looping.
 Serve: app = mcp.streamable_http_app(); wrap it in a pure-ASGI BearerAuth middleware (check
@@ -257,13 +342,26 @@ test_mouser: batch body uses "|"; fixture mapping; missing MPN → found false; 
 caplog contains no real key and no "apiKey=" followed by anything except "***".
 test_storage: TTL expiry; not-found TTL; reserve stops at limit-reserve; new UTC day resets.
 test_api: 401 without key; partial result when Mouser errors; BOM totals; dedupe; 413.
-test_mcp: list_tools shows 4 tools all readOnlyHint; get_part_offers calls mocked REST.
+test_mcp: read server lists 8 tools all readOnlyHint; cart server adds 3; get_part_offers calls mocked REST.
+test_specs: the example sends exactly fixtures/digikey_keyword_specs_10nF50V.request.json; filters echo; mapping
+(ValueText, cut tape, no marketplace/Vishay); cache key = the DigiKey request (spelling/order-independent; other
+values, max_results, exclusions, fresh, category miss); flags off send no filter; bad category/spec/value,
+duplicate parameter, parent category → 422 with no search; invalid or misspelled request fields → 422 before any
+call; every DigiKey failure (5xx, 4xx, short/shifted page, no ProductsCount, empty options/tree) → provider_status,
+not cached; exact page calls; a failed page cancels the rest; _pick; leaf category. test_normalize:
+parse_quantity, match_values, closest_values. test_storage: concurrent interleaved requests on one connection.
+test_mcp: search_by_specs request + compact output; price_bom providers.
+test_cart: specs cached; substitutes/related mapping; cart endpoints 403 for non-cart clients; not
+connected → not_connected; OAuth state one-use; refresh token rotation saved; MyList find-or-create + add;
+Mouser cart uses the cart key, remembers the created CartKey, never leaks the key.
 
-## Live acceptance (scripts/smoke_live.sh, uses real keys, ~15 calls total)
+## Live acceptance (scripts/smoke_live.sh, uses real keys, ~19 calls total)
 1. /health both configured. 2. /v1/part?mpn=LM358DR&qty=100 → both providers ok, offers>0.
 3. Same call again → from_cache true, response < 50 ms. 4. mpn=LM1117IMPX-3.3/NOPB works.
 5. mpn=NOTAREALPART12345XYZ → found false for both, NOT an error.
 6. BOM of 20 lines (bench/testset.csv head) → mouser upstream calls ≤ 2 (check /v1/stats).
+7. /v1/search/specs 10nF 50V 10% X7R 0603, in stock, no Vishay → total > 0 (74 on 2026-11-25), all of them
+   returned (up to 200), every result Active and not Vishay, Capacitance searched as 3 DigiKey values.
 
 ## Benchmark (bench/bench_direct.py)
 Read bench/testset.csv. Save /v1/quota before. Pass 1: POST /v1/bom/price fresh=true (time it).
